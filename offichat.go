@@ -12,13 +12,13 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	webview "github.com/webview/webview_go"
 )
 
 const (
@@ -546,29 +546,34 @@ func (a *app) routes() http.Handler {
 	m.Handle("/files/", http.StripPrefix("/files/", http.FileServer(http.Dir(a.recvDir))))
 	return m
 }
-func openBrowser(url string) {
-	var c *exec.Cmd
-	switch runtime.GOOS {
-	case "windows":
-		c = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
-	case "darwin":
-		c = exec.Command("open", url)
-	default:
-		c = exec.Command("xdg-open", url)
-	}
-	_ = c.Start()
-}
+
 func main() {
 	st = newApp()
-	url := "http://localhost:8080"
-	fmt.Println("OffiChat запущен:", url)
+
+	srv := &http.Server{
+		Addr:              webAddr,
+		Handler:           st.routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Println("Ошибка сервера:", err)
+		}
+	}()
+
+	time.Sleep(200 * time.Millisecond)
+
+	fmt.Println("OffiChat запущен в нативном окне")
 	fmt.Println("IP для подключения:", localIP(), "порт", tcpPort)
 	fmt.Println("Полученные файлы:", st.recvDir)
-	go func() { time.Sleep(300 * time.Millisecond); openBrowser(url) }()
-	srv := &http.Server{Addr: webAddr, Handler: st.routes(), ReadHeaderTimeout: 5 * time.Second}
-	if e := srv.ListenAndServe(); e != nil {
-		fmt.Println("Ошибка сервера:", e)
-	}
+
+	w := webview.New(false)
+	defer w.Destroy()
+
+	w.SetTitle("OffiChat")
+	w.SetSize(1024, 768, webview.HintNone)
+	w.Navigate("http://" + webAddr)
+	w.Run()
 }
 
 const pageHTML = `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OffiChat</title><style>
@@ -588,7 +593,6 @@ $('file').onchange=async e=>{let f=e.target.files[0];if(!f)return;if(f.size>15*1
 function renderMessage(m){if(m.kind==='voice'){playVoice(m.text);return}let d=document.createElement('div');d.className='bubble '+(m.from==='me'?'me':m.from==='system'?'system':'');if(m.kind==='image'&&m.path){let im=document.createElement('img');im.src=m.path;im.className='file';im.style.maxHeight='320px';d.appendChild(im)}else if(m.kind==='video'&&m.path){let v=document.createElement('video');v.src=m.path;v.controls=true;v.className='file';v.style.maxHeight='320px';d.appendChild(v)}else if(m.path){let a=document.createElement('a');a.href=m.path;a.textContent='📎 '+m.text;a.download=m.text;d.appendChild(a)}else d.appendChild(document.createTextNode(m.text));if(m.time){let tm=document.createElement('div');tm.className='time';tm.textContent=m.time;d.appendChild(tm)}$('chat').appendChild(d)}
 async function refresh(reset=false){try{let s=await api('/api/state?since='+(reset?0:last+1));state=s.state;$('status').textContent=s.status;$('peer').textContent=(s.peer?'Собеседник: '+s.peer+' · ':'')+'IP этого ПК: '+s.localIp+':5000';$('dot').className='dot '+state;if(reset){$('chat').innerHTML='';last=-1}for(let m of s.messages){if(m.id>last){renderMessage(m);last=Math.max(last,m.id)}}$('chat').scrollTop=$('chat').scrollHeight;if(s.profiles){profiles=s.profiles;current=s.current||null;renderContacts()}if($('myName').value===''&&s.name)$('myName').value=s.name}catch(e){}}setInterval(()=>refresh(),700);refresh(true);roleChanged();
 function playVoice(b64){try{audioCtx=audioCtx||new AudioContext({sampleRate:8000});let raw=atob(b64),buf=audioCtx.createBuffer(1,raw.length,8000),ch=buf.getChannelData(0);for(let i=0;i<raw.length;i++)ch[i]=mulawToLinear(raw.charCodeAt(i))/32768;let src=audioCtx.createBufferSource();src.buffer=buf;src.connect(audioCtx.destination);let start=Math.max(audioCtx.currentTime,nextPlay);src.start(start);nextPlay=start+buf.duration}catch(e){}}
-// G.711 μ-law codec compatible with VoiceEngine.kt (8 kHz, mono, 320-byte/40 ms frames).
 function linearToMulaw(sample){let s=Math.max(-32635,Math.min(32635,Math.round(sample))),sign=s<0?128:0;if(s<0)s=-s;s+=132;let exp=7,mask=0x4000;while(exp>0&&(s&mask)===0){exp--;mask>>=1}let mant=(s>>(exp+3))&15;return (~(sign|(exp<<4)|mant))&255}
 function mulawToLinear(b){let u=(~b)&255,sign=u&128,exp=(u>>4)&7,mant=u&15,s=(((mant<<3)+132)<<exp)-132;return sign?-s:s}
 async function startVoice(){if(state!=='connected'){alert('Сначала подключитесь');return}try{audioCtx=audioCtx||new AudioContext({sampleRate:8000});await audioCtx.resume();micStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,sampleRate:8000,echoCancellation:true}});let src=audioCtx.createMediaStreamSource(micStream);processor=audioCtx.createScriptProcessor(1024,1,1);processor.onaudioprocess=e=>{if(!voiceOn)return;let x=e.inputBuffer.getChannelData(0);let bytes=[],step=Math.max(1,Math.round(audioCtx.sampleRate/8000));for(let i=0;i<x.length;i+=step)bytes.push(linearToMulaw(x[i]*32767));if(bytes.length)fetch('/api/voice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({data:btoa(String.fromCharCode(...bytes))})}).catch(()=>{})};src.connect(processor);processor.connect(audioCtx.destination);voiceOn=true;$('talk').textContent='🔴 Отпустить';}catch(e){alert('Микрофон недоступен: '+e.message);stopVoice()}}
